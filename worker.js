@@ -1,58 +1,57 @@
-// worker.js
 export default {
   async fetch(request) {
     const { searchParams } = new URL(request.url);
     const url = searchParams.get("url");
 
-    if (!url) {
-      return new Response(JSON.stringify({
-        success: false,
-        error: "Missing 'url' parameter",
-        usage: "https://instagram-downloader-api.workers.dev/?url=https://www.instagram.com/reel/xyz",
-        join: "https://t.me/zerocreations"
-      }, null, 2), {
-        headers: { "Content-Type": "application/json" }
-      });
+    if (!url || !url.includes("instagram.com")) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "Missing or invalid Instagram URL",
+          join: "https://t.me/zerocreations"
+        }, null, 2),
+        { headers: { "Content-Type": "application/json" } }
+      );
     }
 
     try {
-      const api = `https://media.fastdl.app/api/instagram?url=${encodeURIComponent(url)}`;
-      const res = await fetch(api);
-      const data = await res.json();
+      const formBody = `url=${encodeURIComponent(url)}&lang=en`;
+      const res = await fetch("https://snapinsta.to/action.php", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        },
+        body: formBody
+      });
 
-      if (!data || !data.video) {
-        return new Response(JSON.stringify({
-          success: false,
-          error: "Invalid or unsupported Instagram URL",
-          join: "https://t.me/zerocreations"
-        }, null, 2), {
-          headers: { "Content-Type": "application/json" }
-        });
+      const html = await res.text();
+      const videoMatch = html.match(/href="(https:\/\/[^"]+\.mp4)"/);
+      const thumbMatch = html.match(/<img[^>]+src="(https:\/\/[^"]+\.jpg)"/);
+
+      if (!videoMatch) {
+        throw new Error("HD video URL not found");
       }
 
-      return new Response(JSON.stringify({
-        success: true,
-        platform: "Instagram",
-        username: data.username || null,
-        caption: data.caption || null,
-        duration: data.duration || null,
-        thumbnail: data.thumbnail,
-        video_url: data.video,
-        hd_video: data.hd || data.video,
-        join: "https://t.me/zerocreations"
-      }, null, 2), {
-        headers: { "Content-Type": "application/json" }
-      });
-
+      return new Response(
+        JSON.stringify({
+          success: true,
+          video_url: videoMatch[1],
+          thumbnail: thumbMatch ? thumbMatch[1] : null,
+          join: "https://t.me/zerocreations"
+        }, null, 2),
+        { headers: { "Content-Type": "application/json" } }
+      );
     } catch (err) {
-      return new Response(JSON.stringify({
-        success: false,
-        error: "Failed to fetch Instagram video",
-        message: err.message,
-        join: "https://t.me/zerocreations"
-      }, null, 2), {
-        headers: { "Content-Type": "application/json" }
-      });
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "Failed to scrape video",
+          message: err.message,
+          join: "https://t.me/zerocreations"
+        }, null, 2),
+        { headers: { "Content-Type": "application/json" } }
+      );
     }
   }
 };
