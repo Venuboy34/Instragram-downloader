@@ -437,29 +437,54 @@ function parseInstagramHTML(html, url) {
     const videoPatterns = [
       /"video_url":"([^"]+)"/g,
       /"playback_url":"([^"]+)"/g,
+      /"video_versions":\[.*?"url":"([^"]+)"/g,
       /"video_versions":\[{"type":"[^"]+","url":"([^"]+)"/g,
-      /"src":"([^"]+\.mp4[^"]*)"/g
+      /"src":"([^"]+\.mp4[^"]*)"/g,
+      /video_url&quot;:&quot;([^&]+)/g,
+      /"videoUrl":"([^"]+)"/g,
+      /"contentUrl":"([^"]+\.mp4[^"]*)"/g,
+      /https:\/\/[^"]*\.mp4[^"]*/g,
+      /"dash_manifest":"([^"]+)"/g,
+      /"hls_manifest":"([^"]+)"/g
     ];
 
     videoPatterns.forEach(pattern => {
       let match;
       while ((match = pattern.exec(html)) !== null) {
-        let videoUrl = match[1];
+        let videoUrl = match[1] || match[0];
         
         // Clean up the URL
         videoUrl = videoUrl.replace(/\\u0026/g, '&');
         videoUrl = videoUrl.replace(/\\\//g, '/');
         videoUrl = videoUrl.replace(/\\"/g, '"');
+        videoUrl = videoUrl.replace(/&quot;/g, '"');
+        videoUrl = videoUrl.replace(/&amp;/g, '&');
         
         // Skip non-video URLs
-        if (!videoUrl.includes('.mp4') && !videoUrl.includes('video')) continue;
-        if (videoUrl.includes('thumbnail') || videoUrl.includes('_n.jpg')) continue;
+        if (!videoUrl.includes('.mp4') && !videoUrl.includes('video') && !videoUrl.includes('manifest')) continue;
+        if (videoUrl.includes('thumbnail') || videoUrl.includes('_n.jpg') || videoUrl.includes('photo')) continue;
         
-        if (!result.video_url) {
+        // Prioritize .mp4 URLs
+        if (videoUrl.includes('.mp4') && !result.video_url) {
+          result.video_url = videoUrl;
+        } else if (!result.video_url && (videoUrl.includes('video') || videoUrl.includes('manifest'))) {
           result.video_url = videoUrl;
         }
       }
     });
+
+    // Additional fallback: Look for any video URLs in script content
+    if (!result.video_url) {
+      const scriptMatches = html.match(/<script[^>]*>[\s\S]*?<\/script>/gi) || [];
+      for (const script of scriptMatches) {
+        const videoUrlMatch = script.match(/https:\/\/[^"'\s]*video[^"'\s]*\.mp4[^"'\s]*/i) ||
+                             script.match(/https:\/\/[^"'\s]*\.mp4[^"'\s]*/i);
+        if (videoUrlMatch) {
+          result.video_url = videoUrlMatch[0];
+          break;
+        }
+      }
+    }
 
     // Extract video dimensions and duration
     const dimensionMatch = html.match(/"dimensions":{"height":(\d+),"width":(\d+)}/);
@@ -524,11 +549,33 @@ function detectMediaType(url) {
 }
 
 function extractAuthorFromDescription(description) {
-  const match = description.match(/^([^:•]+)[:•]/);
-  return match ? match[1].trim() : 'Unknown';
+  // Handle the format "91K likes, 60 comments - username on April 7, 2025"
+  let match = description.match(/- ([^:]+) on \w+ \d+, \d+/);
+  if (match) return match[1].trim();
+  
+  // Handle the format "username: caption text"
+  match = description.match(/^([^:•]+)[:•]/);
+  if (match) return match[1].trim();
+  
+  // Handle format with likes and comments first
+  match = description.match(/^\d+[KM]? likes, \d+ comments - ([^:]+):/);
+  if (match) return match[1].trim();
+  
+  return 'Unknown';
 }
 
 function extractAuthorFromTitle(title) {
-  const match = title.match(/^([^']+)'s?\s+Instagram/i);
-  return match ? match[1].trim() : 'Unknown';
+  // Handle the format "&#064;username on Instagram: "caption""
+  let match = title.match(/&#064;([^:]+) on Instagram:/);
+  if (match) return match[1].trim();
+  
+  // Handle the format "@username on Instagram: "caption""
+  match = title.match(/@([^:]+) on Instagram:/);
+  if (match) return match[1].trim();
+  
+  // Handle the format "username's Instagram"
+  match = title.match(/^([^']+)'s?\s+Instagram/i);
+  if (match) return match[1].trim();
+  
+  return 'Unknown';
 }
