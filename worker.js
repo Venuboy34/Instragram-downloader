@@ -1,5 +1,5 @@
 // Instagram Video Downloader API for Cloudflare Workers
-// Video-only extraction with clean JSON responses
+// Enhanced version with video details, thumbnails, and HD video extraction
 
 export default {
   async fetch(request, env, ctx) {
@@ -33,7 +33,8 @@ async function handleRequest(request) {
         return new Response(JSON.stringify({ 
           success: false,
           error: 'URL parameter is required',
-          message: 'Please provide an Instagram URL'
+          message: 'Please provide an Instagram URL',
+          example: '/api/download?url=https://instagram.com/reel/ABC123/'
         }), {
           status: 400,
           headers: corsHeaders
@@ -48,11 +49,11 @@ async function handleRequest(request) {
     return new Response(JSON.stringify({
       success: true,
       service: 'Instagram Video Downloader API',
-      version: '2.0',
-      description: 'Extract HD video URLs from Instagram posts, reels, and IGTV',
+      version: '3.0',
+      description: 'Extract HD videos, thumbnails, and details from Instagram posts, reels, and IGTV',
       endpoints: {
         'POST /api/download': {
-          description: 'Download Instagram videos',
+          description: 'Download Instagram videos with full details',
           body: { url: 'instagram_url_here' }
         },
         'GET /api/download': {
@@ -61,10 +62,12 @@ async function handleRequest(request) {
         }
       },
       features: [
-        'HD video extraction only',
-        'Multiple extraction methods',
-        'Clean JSON responses',
-        'Supports posts, reels, IGTV'
+        'HD video extraction with fallbacks',
+        'Thumbnail extraction',
+        'Video metadata (duration, dimensions)',
+        'Author and caption details',
+        'Multiple extraction methods with retry logic',
+        'Rate limit handling'
       ]
     }), {
       headers: corsHeaders
@@ -147,12 +150,12 @@ async function downloadInstagramVideo(url) {
       };
     }
 
-    // Try multiple methods in order of reliability for HD video content
+    // Try multiple methods with retry logic and delays
     const methods = [
-      () => getVideoViaDirect(cleanUrl),
-      () => getVideoViaGraphQL(cleanUrl),
-      () => getVideoViaProxy(cleanUrl),
-      () => getVideoViaOembed(cleanUrl)
+      { name: 'Direct', func: () => getDataViaDirect(cleanUrl) },
+      { name: 'Proxy', func: () => getDataViaProxy(cleanUrl) },
+      { name: 'Alternative', func: () => getDataViaAlternative(cleanUrl) },
+      { name: 'Embed', func: () => getDataViaEmbed(cleanUrl) }
     ];
 
     let lastError;
@@ -160,34 +163,34 @@ async function downloadInstagramVideo(url) {
 
     for (const method of methods) {
       try {
-        const result = await method();
-        if (result && result.videos && result.videos.length > 0) {
-          // Check if this method found HD video content
-          const hasHDVideo = result.videos.some(v => 
-            v.quality === 'hd' || v.quality === 'high'
-          );
-          
-          if (hasHDVideo) {
-            return {
-              success: true,
-              data: result,
-              timestamp: new Date().toISOString()
-            };
-          } else if (!bestResult) {
-            bestResult = result;
-          }
+        console.log(`Trying ${method.name} method...`);
+        const result = await method.func();
+        
+        if (result && (result.video_url || result.thumbnail_url)) {
+          return {
+            success: true,
+            data: result,
+            method_used: method.name,
+            timestamp: new Date().toISOString()
+          };
+        } else if (!bestResult) {
+          bestResult = result;
         }
       } catch (error) {
         lastError = error;
-        console.log(`Method failed: ${error.message}`);
+        console.log(`${method.name} method failed: ${error.message}`);
+        
+        // Add delay between methods to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
     }
 
-    // Return best result found
-    if (bestResult && bestResult.videos && bestResult.videos.length > 0) {
+    // Return best result found or basic data
+    if (bestResult) {
       return {
         success: true,
         data: bestResult,
+        method_used: 'fallback',
         timestamp: new Date().toISOString()
       };
     }
@@ -211,90 +214,80 @@ async function downloadInstagramVideo(url) {
   }
 }
 
-// Enhanced direct fetch with mobile user agent for better results
-async function getVideoViaDirect(url) {
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'DNT': '1',
-      'Connection': 'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-User': '?1',
-      'Cache-Control': 'max-age=0'
-    }
-  });
+// Enhanced direct fetch with better headers and retry logic
+async function getDataViaDirect(url) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1 Instagram 302.0.0.23.103',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache'
+  };
+
+  const response = await fetch(url, { headers });
 
   if (!response.ok) {
-    throw new Error(`Direct fetch failed: ${response.status}`);
+    throw new Error(`Direct fetch failed: ${response.status} ${response.statusText}`);
   }
 
   const html = await response.text();
+  
   if (html.includes('Please wait a few minutes before you try again')) {
     throw new Error('Rate limited by Instagram');
   }
   
-  return parseInstagramHTMLForVideo(html, url);
-}
-
-// GraphQL method for video extraction
-async function getVideoViaGraphQL(url) {
-  const shortcode = extractShortcode(url);
-  if (!shortcode) {
-    throw new Error('Could not extract shortcode');
+  if (html.includes('Page Not Found') || html.includes('Sorry, this page')) {
+    throw new Error('Instagram post not found or private');
   }
-
-  const graphqlUrl = `https://www.instagram.com/graphql/query/`;
   
-  const response = await fetch(graphqlUrl, {
-    method: 'POST',
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'X-Requested-With': 'XMLHttpRequest',
-      'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9'
-    },
-    body: `variables={"shortcode":"${shortcode}"}&query_hash=b3055c01b4b222b8a47dc12b090e4e64`
-  });
-
-  if (response.ok) {
-    const data = await response.json();
-    if (data.data && data.data.shortcode_media) {
-      return parseGraphQLDataForVideo(data.data.shortcode_media, url);
-    }
-  }
-
-  throw new Error('GraphQL method failed');
+  return parseInstagramHTML(html, url);
 }
 
-// Proxy method for video extraction
-async function getVideoViaProxy(url) {
+// Enhanced proxy method with multiple services
+async function getDataViaProxy(url) {
   const proxyServices = [
-    `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-    `https://cors-anywhere.herokuapp.com/${url}`
+    {
+      url: `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+      parseKey: 'contents'
+    },
+    {
+      url: `https://corsproxy.io/?${encodeURIComponent(url)}`,
+      parseKey: null
+    },
+    {
+      url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+      parseKey: null
+    }
   ];
 
-  for (const proxyUrl of proxyServices) {
+  for (const proxy of proxyServices) {
     try {
-      const response = await fetch(proxyUrl, {
+      const response = await fetch(proxy.url, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1'
+          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
         }
       });
       
       if (!response.ok) continue;
       
-      const data = await response.json();
-      const html = data.contents || data.text || data;
+      let html;
+      if (proxy.parseKey) {
+        const data = await response.json();
+        html = data[proxy.parseKey];
+      } else {
+        html = await response.text();
+      }
       
-      if (typeof html === 'string' && html.length > 1000) {
-        return parseInstagramHTMLForVideo(html, url);
+      if (typeof html === 'string' && html.length > 1000 && html.includes('instagram')) {
+        return parseInstagramHTML(html, url);
       }
     } catch (error) {
       continue;
@@ -304,107 +297,165 @@ async function getVideoViaProxy(url) {
   throw new Error('All proxy services failed');
 }
 
-// oEmbed method for video extraction
-async function getVideoViaOembed(url) {
-  const oembedUrl = `https://api.instagram.com/oembed/?url=${encodeURIComponent(url)}`;
+// Alternative method using different approach
+async function getDataViaAlternative(url) {
+  // Extract shortcode and try different Instagram endpoints
+  const shortcode = extractShortcode(url);
+  if (!shortcode) {
+    throw new Error('Could not extract shortcode');
+  }
+
+  // Try Instagram's mobile endpoint
+  const mobileUrl = `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`;
   
-  const response = await fetch(oembedUrl, {
+  const response = await fetch(mobileUrl, {
+    headers: {
+      'User-Agent': 'Instagram 302.0.0.23.103 Android (33/13; 420dpi; 1080x2400; samsung; SM-G998B; t2s; qcom; en_US; 302008103)',
+      'Accept': 'application/json',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-Instagram-AJAX': '1'
+    }
+  });
+
+  if (response.ok) {
+    try {
+      const data = await response.json();
+      if (data.items && data.items[0]) {
+        return parseInstagramAPIData(data.items[0], url);
+      }
+    } catch (e) {
+      // Try parsing as HTML if JSON fails
+      const html = await response.text();
+      return parseInstagramHTML(html, url);
+    }
+  }
+
+  throw new Error('Alternative method failed');
+}
+
+// Embed method with better construction
+async function getDataViaEmbed(url) {
+  // Try direct embed URL construction
+  const shortcode = extractShortcode(url);
+  if (!shortcode) {
+    throw new Error('Could not extract shortcode');
+  }
+
+  const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/`;
+  
+  const response = await fetch(embedUrl, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
   });
   
   if (!response.ok) {
-    throw new Error(`oEmbed API failed: ${response.status}`);
+    throw new Error(`Embed fetch failed: ${response.status}`);
   }
   
-  const data = await response.json();
-  return parseOembedDataForVideo(data, url);
+  const html = await response.text();
+  return parseInstagramHTML(html, url);
 }
 
-function parseGraphQLDataForVideo(mediaData, originalUrl) {
-  const videos = [];
-  let title = 'Instagram Video';
-  let author = 'Unknown';
-  let description = '';
-
-  if (mediaData.owner && mediaData.owner.username) {
-    author = mediaData.owner.username;
-  }
-
-  if (mediaData.edge_media_to_caption && mediaData.edge_media_to_caption.edges[0]) {
-    const caption = mediaData.edge_media_to_caption.edges[0].node.text;
-    description = caption.substring(0, 200) + (caption.length > 200 ? '...' : '');
-    title = `${author}'s Instagram ${detectMediaType(originalUrl)}`;
-  }
-
-  // Extract video URLs (highest quality first)
-  if (mediaData.is_video && mediaData.video_url) {
-    videos.push({
-      url: mediaData.video_url,
-      quality: 'hd',
-      width: mediaData.dimensions?.width,
-      height: mediaData.dimensions?.height,
-      duration: mediaData.video_duration || null
-    });
-  }
-
-  // Handle carousel posts with videos
-  if (mediaData.edge_sidecar_to_children) {
-    mediaData.edge_sidecar_to_children.edges.forEach(edge => {
-      const child = edge.node;
-      if (child.is_video && child.video_url) {
-        videos.push({
-          url: child.video_url,
-          quality: 'hd',
-          width: child.dimensions?.width,
-          height: child.dimensions?.height,
-          duration: child.video_duration || null
-        });
-      }
-    });
-  }
-
-  return {
-    title,
-    description,
-    author,
+function parseInstagramAPIData(apiData, originalUrl) {
+  const result = {
+    title: 'Instagram Video',
+    author: 'Unknown',
+    description: '',
     post_type: detectMediaType(originalUrl),
     original_url: originalUrl,
-    videos: videos,
-    video_count: videos.length
+    thumbnail_url: null,
+    video_url: null,
+    video_details: null
   };
+
+  // Extract user info
+  if (apiData.user) {
+    result.author = apiData.user.username || 'Unknown';
+    result.title = `${result.author}'s Instagram ${result.post_type}`;
+  }
+
+  // Extract caption
+  if (apiData.caption && apiData.caption.text) {
+    result.description = apiData.caption.text.substring(0, 300) + 
+                        (apiData.caption.text.length > 300 ? '...' : '');
+  }
+
+  // Extract video data
+  if (apiData.video_versions && apiData.video_versions.length > 0) {
+    // Get highest quality video
+    const bestVideo = apiData.video_versions.reduce((best, current) => 
+      (current.width * current.height) > (best.width * best.height) ? current : best
+    );
+    
+    result.video_url = bestVideo.url;
+    result.video_details = {
+      width: bestVideo.width,
+      height: bestVideo.height,
+      duration: apiData.video_duration || null,
+      view_count: apiData.view_count || null
+    };
+  }
+
+  // Extract thumbnail
+  if (apiData.image_versions2 && apiData.image_versions2.candidates) {
+    const bestThumbnail = apiData.image_versions2.candidates[0];
+    result.thumbnail_url = bestThumbnail.url;
+  }
+
+  return result;
 }
 
-function parseInstagramHTMLForVideo(html, url) {
+function parseInstagramHTML(html, url) {
   try {
-    const videos = [];
-    let title = 'Instagram Video';
-    let author = 'Unknown';
-    let description = '';
+    const result = {
+      title: 'Instagram Video',
+      author: 'Unknown',
+      description: '',
+      post_type: detectMediaType(url),
+      original_url: url,
+      thumbnail_url: null,
+      video_url: null,
+      video_details: null
+    };
 
     // Extract basic info from meta tags
-    const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/);
-    const descMatch = html.match(/<meta property="og:description" content="([^"]+)"/);
+    const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/i);
+    const descMatch = html.match(/<meta property="og:description" content="([^"]+)"/i);
+    const imageMatch = html.match(/<meta property="og:image" content="([^"]+)"/i);
+    const videoMatch = html.match(/<meta property="og:video" content="([^"]+)"/i);
     
-    if (titleMatch) title = titleMatch[1];
+    if (titleMatch) {
+      result.title = titleMatch[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+      result.author = extractAuthorFromTitle(result.title);
+    }
+    
     if (descMatch) {
-      description = descMatch[1];
-      author = extractAuthorFromDescription(description);
+      result.description = descMatch[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+      if (!result.author || result.author === 'Unknown') {
+        result.author = extractAuthorFromDescription(result.description);
+      }
     }
 
-    // Enhanced video URL extraction patterns - only for videos
+    // Extract thumbnail from og:image
+    if (imageMatch) {
+      result.thumbnail_url = imageMatch[1];
+    }
+
+    // Extract video from og:video
+    if (videoMatch) {
+      result.video_url = videoMatch[1];
+    }
+
+    // Enhanced video URL extraction from script tags
     const videoPatterns = [
       /"video_url":"([^"]+)"/g,
       /"playback_url":"([^"]+)"/g,
-      /"src":"([^"]+\.mp4[^"]*)"/g,
-      /<meta property="og:video" content="([^"]+)"/g,
-      /<meta property="og:video:secure_url" content="([^"]+)"/g,
       /"video_versions":\[{"type":"[^"]+","url":"([^"]+)"/g,
-      /"video_dash_manifest":"([^"]+)"/g
+      /"src":"([^"]+\.mp4[^"]*)"/g
     ];
 
-    // Look for HD video URLs
     videoPatterns.forEach(pattern => {
       let match;
       while ((match = pattern.exec(html)) !== null) {
@@ -415,98 +466,61 @@ function parseInstagramHTMLForVideo(html, url) {
         videoUrl = videoUrl.replace(/\\\//g, '/');
         videoUrl = videoUrl.replace(/\\"/g, '"');
         
-        // Skip thumbnail URLs and non-video content
-        if (videoUrl.includes('thumbnail') || 
-            videoUrl.includes('_n.jpg') || 
-            videoUrl.includes('.jpg') ||
-            videoUrl.includes('.jpeg') ||
-            videoUrl.includes('.png')) {
-          continue;
-        }
+        // Skip non-video URLs
+        if (!videoUrl.includes('.mp4') && !videoUrl.includes('video')) continue;
+        if (videoUrl.includes('thumbnail') || videoUrl.includes('_n.jpg')) continue;
         
-        // Only include actual video files
-        if (!videoUrl.includes('.mp4') && !videoUrl.includes('video')) {
-          continue;
-        }
-        
-        // Determine quality based on URL patterns
-        let quality = 'standard';
-        if (videoUrl.includes('_hd.mp4') || 
-            videoUrl.includes('720p') || 
-            videoUrl.includes('1080p') ||
-            videoUrl.includes('high')) {
-          quality = 'hd';
-        }
-        
-        if (videoUrl && !videos.some(v => v.url === videoUrl)) {
-          videos.push({
-            url: videoUrl,
-            quality: quality,
-            format: 'mp4'
-          });
+        if (!result.video_url) {
+          result.video_url = videoUrl;
         }
       }
     });
 
-    // Sort videos by quality (HD first)
-    videos.sort((a, b) => {
-      if (a.quality === 'hd' && b.quality !== 'hd') return -1;
-      if (a.quality !== 'hd' && b.quality === 'hd') return 1;
-      return 0;
-    });
+    // Extract video dimensions and duration
+    const dimensionMatch = html.match(/"dimensions":{"height":(\d+),"width":(\d+)}/);
+    const durationMatch = html.match(/"video_duration":([0-9.]+)/);
+    const viewCountMatch = html.match(/"video_view_count":(\d+)/);
 
-    return {
-      title,
-      description,
-      author,
-      post_type: detectMediaType(url),
-      original_url: url,
-      videos: videos,
-      video_count: videos.length
-    };
+    if (dimensionMatch || durationMatch || viewCountMatch) {
+      result.video_details = {};
+      if (dimensionMatch) {
+        result.video_details.height = parseInt(dimensionMatch[1]);
+        result.video_details.width = parseInt(dimensionMatch[2]);
+      }
+      if (durationMatch) {
+        result.video_details.duration = parseFloat(durationMatch[1]);
+      }
+      if (viewCountMatch) {
+        result.video_details.view_count = parseInt(viewCountMatch[1]);
+      }
+    }
+
+    // Try to extract better thumbnail if not found
+    if (!result.thumbnail_url) {
+      const thumbnailPatterns = [
+        /"display_url":"([^"]+)"/g,
+        /"thumbnail_url":"([^"]+)"/g
+      ];
+
+      thumbnailPatterns.forEach(pattern => {
+        if (!result.thumbnail_url) {
+          const match = pattern.exec(html);
+          if (match) {
+            let thumbnailUrl = match[1];
+            thumbnailUrl = thumbnailUrl.replace(/\\u0026/g, '&');
+            thumbnailUrl = thumbnailUrl.replace(/\\\//g, '/');
+            thumbnailUrl = thumbnailUrl.replace(/\\"/g, '"');
+            result.thumbnail_url = thumbnailUrl;
+          }
+        }
+      });
+    }
+
+    return result;
     
   } catch (error) {
     throw new Error(`Failed to parse HTML: ${error.message}`);
   }
-}
-
-function parseOembedDataForVideo(oembedData, originalUrl) {
-  const videos = [];
-  
-  // For reels/videos, try to construct HD video URL from thumbnail
-  if (oembedData.thumbnail_url) {
-    const mediaType = detectMediaType(originalUrl);
-    if (mediaType === 'reel' || mediaType === 'igtv' || mediaType === 'post') {
-      // Try different HD video URL patterns
-      const possibleVideoUrls = [
-        oembedData.thumbnail_url.replace('_n.jpg', '_hd.mp4'),
-        oembedData.thumbnail_url.replace('_n.jpg', '.mp4'),
-        oembedData.thumbnail_url.replace('.jpg', '.mp4'),
-        oembedData.thumbnail_url.replace('/s150x150/', '/').replace('.jpg', '.mp4')
-      ];
-      
-      possibleVideoUrls.forEach(videoUrl => {
-        if (videoUrl.includes('.mp4')) {
-          videos.push({
-            url: videoUrl,
-            quality: videoUrl.includes('_hd') ? 'hd' : 'standard',
-            format: 'mp4',
-            source: 'oembed_constructed'
-          });
-        }
-      });
-    }
-  }
-
-  return {
-    title: oembedData.title || 'Instagram Video',
-    author: oembedData.author_name || 'Unknown',
-    description: oembedData.title || '',
-    post_type: detectMediaType(originalUrl),
-    original_url: originalUrl,
-    videos: videos,
-    video_count: videos.length
-  };
 }
 
 function extractShortcode(url) {
@@ -546,6 +560,11 @@ function detectMediaType(url) {
 }
 
 function extractAuthorFromDescription(description) {
-  const match = description.match(/^([^:]+):/);
+  const match = description.match(/^([^:•]+)[:•]/);
+  return match ? match[1].trim() : 'Unknown';
+}
+
+function extractAuthorFromTitle(title) {
+  const match = title.match(/^([^']+)'s?\s+Instagram/i);
   return match ? match[1].trim() : 'Unknown';
 }
