@@ -44,6 +44,26 @@ async function handleRequest(request) {
     }
   }
 
+  // Video proxy endpoint to handle signed URLs
+  if (url.pathname === '/api/video-proxy') {
+    if (request.method === 'GET') {
+      const videoUrl = url.searchParams.get('url');
+      const referer = url.searchParams.get('referer');
+      
+      if (!videoUrl) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'Video URL parameter is required'
+        }), {
+          status: 400,
+          headers: corsHeaders
+        });
+      }
+      
+      return handleVideoProxy(videoUrl, referer, corsHeaders);
+    }
+  }
+
   // Root endpoint - API info
   if (url.pathname === '/') {
     return new Response(JSON.stringify({
@@ -59,6 +79,10 @@ async function handleRequest(request) {
         'GET /api/download': {
           description: 'Download Instagram videos via URL parameter',
           parameter: 'url=instagram_url_here'
+        },
+        'GET /api/video-proxy': {
+          description: 'Proxy signed video URLs with proper headers',
+          parameters: 'url=video_url_here&referer=instagram_post_url'
         }
       },
       features: [
@@ -76,11 +100,69 @@ async function handleRequest(request) {
   return new Response(JSON.stringify({
     success: false,
     error: 'Endpoint not found',
-    message: 'Available endpoints: GET|POST /api/download'
+    message: 'Available endpoints: GET|POST /api/download, GET /api/video-proxy'
   }), { 
     status: 404, 
     headers: corsHeaders 
   });
+}
+
+async function handleVideoProxy(videoUrl, referer, corsHeaders) {
+  try {
+    const response = await fetch(videoUrl, {
+      headers: {
+        'User-Agent': 'Instagram 302.0.0.23.103 Android (33/13; 420dpi; 1080x2400; samsung; SM-G998B; t2s; qcom; en_US; 302008103)',
+        'Referer': referer || 'https://www.instagram.com/',
+        'Origin': 'https://www.instagram.com',
+        'Accept': 'video/mp4,video/*,*/*;q=0.9',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'DNT': '1',
+        'Connection': 'keep-alive'
+      }
+    });
+
+    if (!response.ok) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'Failed to fetch video',
+        status: response.status,
+        statusText: response.statusText
+      }), {
+        status: response.status,
+        headers: corsHeaders
+      });
+    }
+
+    // Return the video with proper headers
+    const videoHeaders = {
+      'Content-Type': response.headers.get('Content-Type') || 'video/mp4',
+      'Content-Length': response.headers.get('Content-Length'),
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'public, max-age=3600',
+      ...corsHeaders
+    };
+
+    // Remove null headers
+    Object.keys(videoHeaders).forEach(key => {
+      if (videoHeaders[key] === null) {
+        delete videoHeaders[key];
+      }
+    });
+
+    return new Response(response.body, {
+      headers: videoHeaders
+    });
+
+  } catch (error) {
+    return new Response(JSON.stringify({
+      success: false,
+      error: 'Video proxy failed',
+      message: error.message
+    }), {
+      status: 500,
+      headers: corsHeaders
+    });
+  }
 }
 
 async function handleDownload(request, corsHeaders) {
@@ -166,6 +248,9 @@ async function downloadInstagramVideo(url) {
         const result = await method.func();
         
         if (result && result.video_url) {
+          // Validate and potentially proxy the video URL
+          result.video_url = await validateAndProxyVideoUrl(result.video_url, cleanUrl);
+          
           return {
             success: true,
             data: result,
@@ -304,33 +389,51 @@ async function getDataViaAlternative(url) {
     throw new Error('Could not extract shortcode');
   }
 
-  // Try Instagram's mobile endpoint
-  const mobileUrl = `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`;
-  
-  const response = await fetch(mobileUrl, {
-    headers: {
-      'User-Agent': 'Instagram 302.0.0.23.103 Android (33/13; 420dpi; 1080x2400; samsung; SM-G998B; t2s; qcom; en_US; 302008103)',
-      'Accept': 'application/json',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'X-Requested-With': 'XMLHttpRequest',
-      'X-Instagram-AJAX': '1'
-    }
-  });
+  // Try multiple Instagram endpoints
+  const endpoints = [
+    `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`,
+    `https://www.instagram.com/api/v1/media/${shortcode}/info/`,
+    `https://i.instagram.com/api/v1/media/${shortcode}/info/`,
+    `https://www.instagram.com/p/${shortcode}/?__a=1`
+  ];
 
-  if (response.ok) {
+  for (const endpoint of endpoints) {
     try {
-      const data = await response.json();
-      if (data.items && data.items[0]) {
-        return parseInstagramAPIData(data.items[0], url);
+      const response = await fetch(endpoint, {
+        headers: {
+          'User-Agent': 'Instagram 302.0.0.23.103 Android (33/13; 420dpi; 1080x2400; samsung; SM-G998B; t2s; qcom; en_US; 302008103)',
+          'Accept': 'application/json',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-Instagram-AJAX': '1',
+          'X-CSRFToken': 'missing',
+          'X-IG-App-ID': '936619743392459'
+        }
+      });
+
+      if (response.ok) {
+        try {
+          const data = await response.json();
+          if (data.items && data.items[0]) {
+            return parseInstagramAPIData(data.items[0], url);
+          } else if (data.graphql && data.graphql.shortcode_media) {
+            return parseGraphQLData(data.graphql.shortcode_media, url);
+          }
+        } catch (e) {
+          // Try parsing as HTML if JSON fails
+          const html = await response.text();
+          if (html.length > 1000) {
+            return parseInstagramHTML(html, url);
+          }
+        }
       }
-    } catch (e) {
-      // Try parsing as HTML if JSON fails
-      const html = await response.text();
-      return parseInstagramHTML(html, url);
+    } catch (error) {
+      console.log(`Endpoint ${endpoint} failed: ${error.message}`);
+      continue;
     }
   }
 
-  throw new Error('Alternative method failed');
+  throw new Error('All alternative endpoints failed');
 }
 
 // Embed method with better construction
@@ -355,6 +458,43 @@ async function getDataViaEmbed(url) {
   
   const html = await response.text();
   return parseInstagramHTML(html, url);
+}
+
+function parseGraphQLData(media, originalUrl) {
+  const result = {
+    title: 'Instagram Video',
+    author: 'Unknown',
+    description: '',
+    post_type: detectMediaType(originalUrl),
+    original_url: originalUrl,
+    video_url: null,
+    video_details: null
+  };
+
+  // Extract user info
+  if (media.owner) {
+    result.author = media.owner.username || 'Unknown';
+    result.title = `${result.author}'s Instagram ${result.post_type}`;
+  }
+
+  // Extract caption
+  if (media.edge_media_to_caption && media.edge_media_to_caption.edges[0]) {
+    const caption = media.edge_media_to_caption.edges[0].node.text;
+    result.description = caption.substring(0, 300) + (caption.length > 300 ? '...' : '');
+  }
+
+  // Extract video data
+  if (media.video_url) {
+    result.video_url = media.video_url;
+    result.video_details = {
+      width: media.dimensions?.width || null,
+      height: media.dimensions?.height || null,
+      duration: media.video_duration || null,
+      view_count: media.video_view_count || null
+    };
+  }
+
+  return result;
 }
 
 function parseInstagramAPIData(apiData, originalUrl) {
