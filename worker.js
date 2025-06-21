@@ -1,5 +1,5 @@
 // Instagram Video Downloader API for Cloudflare Workers
-// Enhanced version with video details, thumbnails, and HD video extraction
+// Enhanced version with video details only - no thumbnails
 
 export default {
   async fetch(request, env, ctx) {
@@ -50,7 +50,7 @@ async function handleRequest(request) {
       success: true,
       service: 'Instagram Video Downloader API',
       version: '3.0',
-      description: 'Extract HD videos, thumbnails, and details from Instagram posts, reels, and IGTV',
+      description: 'Extract HD videos and details from Instagram posts, reels, and IGTV',
       endpoints: {
         'POST /api/download': {
           description: 'Download Instagram videos with full details',
@@ -63,7 +63,6 @@ async function handleRequest(request) {
       },
       features: [
         'HD video extraction with fallbacks',
-        'Thumbnail extraction',
         'Video metadata (duration, dimensions)',
         'Author and caption details',
         'Multiple extraction methods with retry logic',
@@ -166,7 +165,7 @@ async function downloadInstagramVideo(url) {
         console.log(`Trying ${method.name} method...`);
         const result = await method.func();
         
-        if (result && (result.video_url || result.thumbnail_url)) {
+        if (result && result.video_url) {
           return {
             success: true,
             data: result,
@@ -365,7 +364,6 @@ function parseInstagramAPIData(apiData, originalUrl) {
     description: '',
     post_type: detectMediaType(originalUrl),
     original_url: originalUrl,
-    thumbnail_url: null,
     video_url: null,
     video_details: null
   };
@@ -398,12 +396,6 @@ function parseInstagramAPIData(apiData, originalUrl) {
     };
   }
 
-  // Extract thumbnail
-  if (apiData.image_versions2 && apiData.image_versions2.candidates) {
-    const bestThumbnail = apiData.image_versions2.candidates[0];
-    result.thumbnail_url = bestThumbnail.url;
-  }
-
   return result;
 }
 
@@ -415,7 +407,6 @@ function parseInstagramHTML(html, url) {
       description: '',
       post_type: detectMediaType(url),
       original_url: url,
-      thumbnail_url: null,
       video_url: null,
       video_details: null
     };
@@ -423,7 +414,6 @@ function parseInstagramHTML(html, url) {
     // Extract basic info from meta tags
     const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/i);
     const descMatch = html.match(/<meta property="og:description" content="([^"]+)"/i);
-    const imageMatch = html.match(/<meta property="og:image" content="([^"]+)"/i);
     const videoMatch = html.match(/<meta property="og:video" content="([^"]+)"/i);
     
     if (titleMatch) {
@@ -436,11 +426,6 @@ function parseInstagramHTML(html, url) {
       if (!result.author || result.author === 'Unknown') {
         result.author = extractAuthorFromDescription(result.description);
       }
-    }
-
-    // Extract thumbnail from og:image
-    if (imageMatch) {
-      result.thumbnail_url = imageMatch[1];
     }
 
     // Extract video from og:video
@@ -493,27 +478,6 @@ function parseInstagramHTML(html, url) {
       if (viewCountMatch) {
         result.video_details.view_count = parseInt(viewCountMatch[1]);
       }
-    }
-
-    // Try to extract better thumbnail if not found
-    if (!result.thumbnail_url) {
-      const thumbnailPatterns = [
-        /"display_url":"([^"]+)"/g,
-        /"thumbnail_url":"([^"]+)"/g
-      ];
-
-      thumbnailPatterns.forEach(pattern => {
-        if (!result.thumbnail_url) {
-          const match = pattern.exec(html);
-          if (match) {
-            let thumbnailUrl = match[1];
-            thumbnailUrl = thumbnailUrl.replace(/\\u0026/g, '&');
-            thumbnailUrl = thumbnailUrl.replace(/\\\//g, '/');
-            thumbnailUrl = thumbnailUrl.replace(/\\"/g, '"');
-            result.thumbnail_url = thumbnailUrl;
-          }
-        }
-      });
     }
 
     return result;
