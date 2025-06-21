@@ -1,5 +1,5 @@
 // Instagram Media Downloader API for Cloudflare Workers
-// Supports Instagram posts, reels, and stories
+// Uses proxy methods for better reliability
 
 export default {
   async fetch(request, env, ctx) {
@@ -103,31 +103,243 @@ async function downloadInstagramMedia(url) {
       throw new Error('Invalid Instagram URL');
     }
 
-    // Get post data
-    const postData = await getInstagramPostData(cleanUrl);
-    
-    if (!postData) {
-      throw new Error('Could not fetch post data');
+    // Try multiple methods with proxy approach
+    const methods = [
+      () => getDataViaOembed(cleanUrl),
+      () => getDataViaProxy(cleanUrl),
+      () => getDataViaDirect(cleanUrl)
+    ];
+
+    let lastError;
+    for (const method of methods) {
+      try {
+        const result = await method();
+        if (result && result.media && result.media.length > 0) {
+          return { success: true, data: result };
+        }
+      } catch (error) {
+        lastError = error;
+        console.log(`Method failed: ${error.message}`);
+      }
     }
 
+    // If no method worked, return basic data
     return {
       success: true,
-      data: postData
+      data: {
+        title: 'Instagram Media',
+        author: 'Unknown',
+        type: detectMediaType(cleanUrl),
+        url: cleanUrl,
+        timestamp: new Date().toISOString(),
+        media: null,
+        error: lastError?.message || 'Could not extract media URLs'
+      }
     };
+    
   } catch (error) {
     throw new Error(`Download failed: ${error.message}`);
   }
 }
 
+// Method 1: Instagram oEmbed API
+async function getDataViaOembed(url) {
+  const oembedUrl = `https://api.instagram.com/oembed/?url=${encodeURIComponent(url)}`;
+  
+  const response = await fetch(oembedUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+  });
+  
+  if (!response.ok) {
+    throw new Error(`oEmbed API failed: ${response.status}`);
+  }
+  
+  const data = await response.json();
+  return parseOembedData(data, url);
+}
+
+// Method 2: Using a proxy service to bypass restrictions
+async function getDataViaProxy(url) {
+  // Use a public proxy service
+  const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+  
+  const response = await fetch(proxyUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Proxy request failed: ${response.status}`);
+  }
+  
+  const data = await response.json();
+  if (!data.contents) {
+    throw new Error('No content received from proxy');
+  }
+  
+  return parseInstagramHTML(data.contents, url);
+}
+
+// Method 3: Direct fetch with better headers
+async function getDataViaDirect(url) {
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'DNT': '1',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Cache-Control': 'max-age=0'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Direct fetch failed: ${response.status}`);
+  }
+
+  const html = await response.text();
+  if (html.includes('Please wait a few minutes before you try again')) {
+    throw new Error('Rate limited by Instagram');
+  }
+  
+  return parseInstagramHTML(html, url);
+}
+
+function parseOembedData(oembedData, originalUrl) {
+  const media = [];
+  
+  if (oembedData.thumbnail_url) {
+    // For reels/videos, try to get the actual video URL
+    if (detectMediaType(originalUrl) === 'reel') {
+      media.push({
+        type: 'video',
+        url: oembedData.thumbnail_url.replace('_n.jpg', '_n.mp4'),
+        quality: 'hd',
+        thumbnail: oembedData.thumbnail_url
+      });
+    }
+    
+    // Always include the thumbnail
+    media.push({
+      type: 'image',
+      url: oembedData.thumbnail_url,
+      quality: 'standard'
+    });
+  }
+
+  return {
+    title: oembedData.title || 'Instagram Post',
+    author: oembedData.author_name || 'Unknown',
+    description: oembedData.title || '',
+    type: detectMediaType(originalUrl),
+    url: originalUrl,
+    timestamp: new Date().toISOString(),
+    media: media.length > 0 ? media : null
+  };
+}
+
+function parseInstagramHTML(html, url) {
+  try {
+    const media = [];
+    let title = 'Instagram Post';
+    let author = 'Unknown';
+    let description = '';
+
+    // Extract basic info from meta tags
+    const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/);
+    const descMatch = html.match(/<meta property="og:description" content="([^"]+)"/);
+    
+    if (titleMatch) title = titleMatch[1];
+    if (descMatch) {
+      description = descMatch[1];
+      author = extractAuthorFromDescription(description);
+    }
+
+    // Look for video URLs
+    const videoPatterns = [
+      /"video_url":"([^"]+)"/g,
+      /<meta property="og:video" content="([^"]+)"/g,
+      /<meta property="og:video:secure_url" content="([^"]+)"/g,
+      /"playback_url":"([^"]+)"/g
+    ];
+
+    videoPatterns.forEach(pattern => {
+      let match;
+      while ((match = pattern.exec(html)) !== null) {
+        let videoUrl = match[1];
+        if (videoUrl.includes('\\u0026')) {
+          videoUrl = videoUrl.replace(/\\u0026/g, '&');
+        }
+        if (videoUrl.includes('\\/')) {
+          videoUrl = videoUrl.replace(/\\\//g, '/');
+        }
+        
+        if (videoUrl && !media.some(m => m.url === videoUrl)) {
+          media.push({
+            type: 'video',
+            url: videoUrl,
+            quality: 'hd'
+          });
+        }
+      }
+    });
+
+    // Look for image URLs
+    const imagePatterns = [
+      /"display_url":"([^"]+)"/g,
+      /<meta property="og:image" content="([^"]+)"/g,
+      /"thumbnail_url":"([^"]+)"/g
+    ];
+
+    imagePatterns.forEach(pattern => {
+      let match;
+      while ((match = pattern.exec(html)) !== null) {
+        let imageUrl = match[1];
+        if (imageUrl.includes('\\u0026')) {
+          imageUrl = imageUrl.replace(/\\u0026/g, '&');
+        }
+        if (imageUrl.includes('\\/')) {
+          imageUrl = imageUrl.replace(/\\\//g, '/');
+        }
+        
+        if (imageUrl && !media.some(m => m.url === imageUrl)) {
+          media.push({
+            type: 'image',
+            url: imageUrl,
+            quality: 'hd'
+          });
+        }
+      }
+    });
+
+    return {
+      title: title,
+      description: description,
+      author: author,
+      type: detectMediaType(url),
+      url: url,
+      timestamp: new Date().toISOString(),
+      media: media.length > 0 ? media : null
+    };
+    
+  } catch (error) {
+    throw new Error(`Failed to parse HTML: ${error.message}`);
+  }
+}
+
 function cleanInstagramUrl(url) {
-  // Remove tracking parameters and clean URL
   let cleanUrl = url.trim();
   
-  // Handle different Instagram URL formats
   if (cleanUrl.includes('instagram.com')) {
-    // Remove query parameters
     cleanUrl = cleanUrl.split('?')[0];
-    // Ensure it ends with /
     if (!cleanUrl.endsWith('/')) {
       cleanUrl += '/';
     }
@@ -145,307 +357,6 @@ function isValidInstagramUrl(url) {
   ];
   
   return patterns.some(pattern => pattern.test(url));
-}
-
-async function getInstagramPostData(url) {
-  try {
-    // Method 1: Try Instagram's oembed API first
-    const oembedUrl = `https://api.instagram.com/oembed/?url=${encodeURIComponent(url)}`;
-    
-    try {
-      const oembedResponse = await fetch(oembedUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-      });
-      
-      if (oembedResponse.ok) {
-        const oembedData = await oembedResponse.json();
-        const parsedData = parseOembedData(oembedData, url);
-        
-        // If oembed worked but no media, try scraping
-        if (!parsedData.media || parsedData.media.length === 0) {
-          const scrapedData = await scrapeInstagramPage(url);
-          if (scrapedData && scrapedData.media) {
-            parsedData.media = scrapedData.media;
-            parsedData.author = scrapedData.author || parsedData.author;
-            parsedData.title = scrapedData.title || parsedData.title;
-          }
-        }
-        
-        return parsedData;
-      }
-    } catch (e) {
-      console.log('Oembed failed, trying scraping method');
-    }
-
-    // Method 2: Scrape the page directly
-    return await scrapeInstagramPage(url);
-    
-  } catch (error) {
-    throw new Error(`Failed to fetch Instagram data: ${error.message}`);
-  }
-}
-
-async function scrapeInstagramPage(url) {
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache'
-    }
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-
-  const html = await response.text();
-  return parseInstagramHTML(html, url);
-
-function parseOembedData(oembedData, originalUrl) {
-  const media = [];
-  
-  // Try to extract high-quality media URLs from thumbnail or other fields
-  if (oembedData.thumbnail_url) {
-    // For videos, thumbnail is usually available but we need the video URL
-    if (detectMediaType(originalUrl) === 'reel' || originalUrl.includes('/tv/')) {
-      // Try to get video URL by modifying thumbnail URL
-      const videoUrl = oembedData.thumbnail_url.replace(/\/s\d+x\d+\//, '/').replace(/\?.*/, '');
-      media.push({
-        type: 'video',
-        url: videoUrl,
-        quality: 'hd',
-        thumbnail: oembedData.thumbnail_url
-      });
-    }
-    
-    // Always add the thumbnail as an image option
-    media.push({
-      type: 'image',
-      url: oembedData.thumbnail_url,
-      quality: 'standard'
-    });
-  }
-
-  return {
-    title: oembedData.title || 'Instagram Post',
-    author: oembedData.author_name || 'Unknown',
-    description: oembedData.title || '',
-    thumbnail: oembedData.thumbnail_url || null,
-    type: detectMediaType(originalUrl),
-    url: originalUrl,
-    timestamp: new Date().toISOString(),
-    media: media.length > 0 ? media : null
-  };
-}
-
-function parseInstagramHTML(html, url) {
-  try {
-    const media = [];
-    let title = 'Instagram Post';
-    let author = 'Unknown';
-    let description = '';
-
-    // Method 1: Extract from script tags containing JSON data
-    const scriptRegex = /<script[^>]*>window\._sharedData\s*=\s*({.+?});<\/script>/;
-    const scriptMatch = html.match(scriptRegex);
-    
-    if (scriptMatch) {
-      try {
-        const data = JSON.parse(scriptMatch[1]);
-        const parsedData = parseSharedData(data, url);
-        if (parsedData && parsedData.media && parsedData.media.length > 0) {
-          return parsedData;
-        }
-      } catch (e) {
-        console.log('Failed to parse _sharedData:', e.message);
-      }
-    }
-
-    // Method 2: Look for newer script tags with different patterns
-    const additionalDataRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([^<]+)<\/script>/g;
-    let match;
-    while ((match = additionalDataRegex.exec(html)) !== null) {
-      try {
-        const jsonData = JSON.parse(match[1]);
-        if (jsonData['@type'] === 'ImageObject' || jsonData['@type'] === 'VideoObject') {
-          if (jsonData.contentUrl) {
-            media.push({
-              type: jsonData['@type'] === 'VideoObject' ? 'video' : 'image',
-              url: jsonData.contentUrl,
-              quality: 'hd'
-            });
-          }
-        }
-      } catch (e) {
-        // Skip invalid JSON
-      }
-    }
-
-    // Method 3: Extract from meta tags
-    const metaTags = {
-      'og:image': [],
-      'og:video': [],
-      'og:video:secure_url': [],
-      'og:title': null,
-      'og:description': null,
-      'twitter:image': [],
-      'twitter:player:stream': []
-    };
-
-    // Extract all meta tags
-    const metaRegex = /<meta\s+(?:property|name)="([^"]+)"\s+content="([^"]+)"/g;
-    let metaMatch;
-    while ((metaMatch = metaRegex.exec(html)) !== null) {
-      const [, property, content] = metaMatch;
-      if (metaTags.hasOwnProperty(property)) {
-        if (Array.isArray(metaTags[property])) {
-          metaTags[property].push(content);
-        } else {
-          metaTags[property] = content;
-        }
-      }
-    }
-
-    // Process meta tag data
-    title = metaTags['og:title'] || title;
-    description = metaTags['og:description'] || description;
-    author = extractAuthorFromDescription(description) || author;
-
-    // Add videos first (higher priority)
-    [...metaTags['og:video'], ...metaTags['og:video:secure_url'], ...metaTags['twitter:player:stream']]
-      .filter(Boolean)
-      .forEach(videoUrl => {
-        if (!media.some(m => m.url === videoUrl)) {
-          media.push({
-            type: 'video',
-            url: videoUrl,
-            quality: 'hd'
-          });
-        }
-      });
-
-    // Add images
-    [...metaTags['og:image'], ...metaTags['twitter:image']]
-      .filter(Boolean)
-      .forEach(imageUrl => {
-        if (!media.some(m => m.url === imageUrl)) {
-          media.push({
-            type: 'image',
-            url: imageUrl,
-            quality: 'hd'
-          });
-        }
-      });
-
-    // Method 4: Look for direct video/image URLs in the HTML
-    const directVideoRegex = /"video_url":"([^"]+)"/g;
-    let videoMatch;
-    while ((videoMatch = directVideoRegex.exec(html)) !== null) {
-      const videoUrl = videoMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
-      if (!media.some(m => m.url === videoUrl)) {
-        media.push({
-          type: 'video',
-          url: videoUrl,
-          quality: 'hd'
-        });
-      }
-    }
-
-    const directImageRegex = /"display_url":"([^"]+)"/g;
-    let imageMatch;
-    while ((imageMatch = directImageRegex.exec(html)) !== null) {
-      const imageUrl = imageMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
-      if (!media.some(m => m.url === imageUrl)) {
-        media.push({
-          type: 'image',
-          url: imageUrl,
-          quality: 'hd'
-        });
-      }
-    }
-
-    return {
-      title: title,
-      description: description,
-      author: author,
-      type: detectMediaType(url),
-      url: url,
-      timestamp: new Date().toISOString(),
-      media: media.length > 0 ? media : null
-    };
-    
-  } catch (error) {
-    throw new Error(`Failed to parse Instagram data: ${error.message}`);
-  }
-}
-
-function parseSharedData(data, url) {
-  try {
-    const posts = data?.entry_data?.PostPage || data?.entry_data?.ProfilePage;
-    if (!posts || !posts[0]) {
-      throw new Error('No post data found');
-    }
-
-    const post = posts[0]?.graphql?.shortcode_media;
-    if (!post) {
-      throw new Error('No media data found');
-    }
-
-    const media = [];
-    
-    // Handle carousel posts (multiple images/videos)
-    if (post.edge_sidecar_to_children) {
-      post.edge_sidecar_to_children.edges.forEach(edge => {
-        const node = edge.node;
-        if (node.is_video) {
-          media.push({
-            type: 'video',
-            url: node.video_url,
-            quality: 'hd',
-            thumbnail: node.display_url
-          });
-        } else {
-          media.push({
-            type: 'image',
-            url: node.display_url,
-            quality: 'hd'
-          });
-        }
-      });
-    } else {
-      // Single media post
-      if (post.is_video) {
-        media.push({
-          type: 'video',
-          url: post.video_url,
-          quality: 'hd',
-          thumbnail: post.display_url
-        });
-      } else {
-        media.push({
-          type: 'image',
-          url: post.display_url,
-          quality: 'hd'
-        });
-      }
-    }
-
-    return {
-      title: post.edge_media_to_caption?.edges?.[0]?.node?.text?.substring(0, 100) || 'Instagram Post',
-      author: post.owner?.username || 'Unknown',
-      type: detectMediaType(url),
-      url: url,
-      timestamp: new Date(post.taken_at_timestamp * 1000).toISOString(),
-      media: media
-    };
-    
-  } catch (error) {
-    throw new Error(`Failed to parse shared data: ${error.message}`);
-  }
 }
 
 function detectMediaType(url) {
@@ -533,11 +444,18 @@ function getHomePage() {
         button:hover {
             transform: translateY(-2px);
         }
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
         .result {
             margin-top: 20px;
             padding: 20px;
             border-radius: 8px;
             display: none;
+            max-height: 300px;
+            overflow-y: auto;
         }
         .success {
             background: #d4edda;
@@ -548,6 +466,20 @@ function getHomePage() {
             background: #f8d7da;
             border: 1px solid #f5c6cb;
             color: #721c24;
+        }
+        .media-item {
+            margin: 10px 0;
+            padding: 10px;
+            background: rgba(255,255,255,0.8);
+            border-radius: 8px;
+        }
+        .media-url {
+            word-break: break-all;
+            color: #007bff;
+            text-decoration: none;
+        }
+        .media-url:hover {
+            text-decoration: underline;
         }
         .endpoints {
             margin-top: 30px;
@@ -576,6 +508,12 @@ function getHomePage() {
             border-radius: 4px;
             font-family: 'Courier New', monospace;
         }
+        .loading {
+            display: none;
+            text-align: center;
+            margin-top: 10px;
+            color: #666;
+        }
     </style>
 </head>
 <body>
@@ -588,12 +526,13 @@ function getHomePage() {
             <input type="url" id="url" placeholder="https://www.instagram.com/p/..." />
         </div>
         
-        <button onclick="downloadMedia()">Download Media</button>
+        <button onclick="downloadMedia()" id="downloadBtn">Download Media</button>
+        <div class="loading" id="loading">Processing... Please wait</div>
         
         <div id="result" class="result"></div>
         
         <div class="endpoints">
-            <h3>API Endpoints:</h3>
+            <h3>🚀 API Endpoints:</h3>
             
             <div class="endpoint">
                 <span class="method post">POST</span>
@@ -605,6 +544,14 @@ function getHomePage() {
                 <span class="method">GET</span>
                 <code>/api/download?url=instagram_url_here</code>
             </div>
+
+            <h4 style="margin-top: 20px;">✨ Features:</h4>
+            <ul style="margin-left: 20px; color: #666;">
+                <li>Multiple extraction methods with proxy support</li>
+                <li>HD quality video and image downloads</li>
+                <li>Works with posts, reels, IGTV, and stories</li>
+                <li>Automatic fallback if one method fails</li>
+            </ul>
         </div>
     </div>
 
@@ -612,11 +559,18 @@ function getHomePage() {
         async function downloadMedia() {
             const url = document.getElementById('url').value.trim();
             const resultDiv = document.getElementById('result');
+            const downloadBtn = document.getElementById('downloadBtn');
+            const loading = document.getElementById('loading');
             
             if (!url) {
                 showResult('Please enter an Instagram URL', 'error');
                 return;
             }
+            
+            // Show loading state
+            downloadBtn.disabled = true;
+            loading.style.display = 'block';
+            resultDiv.style.display = 'none';
             
             try {
                 const response = await fetch('/api/download', {
@@ -629,20 +583,54 @@ function getHomePage() {
                 
                 const data = await response.json();
                 
-                if (data.success) {
-                    showResult('Media found successfully! Check the console for details.', 'success');
-                    console.log('Instagram Media Data:', data.data);
+                if (data.success && data.data) {
+                    displayMediaResult(data.data);
                 } else {
-                    showResult(\`Error: \${data.error}\`, 'error');
+                    showResult(\`Error: \${data.error || 'Unknown error'}\`, 'error');
                 }
             } catch (error) {
                 showResult(\`Network error: \${error.message}\`, 'error');
+            } finally {
+                downloadBtn.disabled = false;
+                loading.style.display = 'none';
             }
+        }
+        
+        function displayMediaResult(data) {
+            const resultDiv = document.getElementById('result');
+            
+            let html = \`
+                <h4>📱 Media Information:</h4>
+                <p><strong>Title:</strong> \${data.title}</p>
+                <p><strong>Author:</strong> \${data.author}</p>
+                <p><strong>Type:</strong> \${data.type}</p>
+            \`;
+            
+            if (data.media && data.media.length > 0) {
+                html += '<h4>🎬 Available Media:</h4>';
+                data.media.forEach((item, index) => {
+                    html += \`
+                        <div class="media-item">
+                            <strong>\${item.type.toUpperCase()} (\${item.quality})</strong><br>
+                            <a href="\${item.url}" target="_blank" class="media-url">\${item.url}</a>
+                        </div>
+                    \`;
+                });
+            } else {
+                html += '<p style="color: orange;">⚠️ No media URLs found. This might be a private post or Instagram blocked the request.</p>';
+                if (data.error) {
+                    html += \`<p style="color: #666; font-size: 14px;">Error: \${data.error}</p>\`;
+                }
+            }
+            
+            resultDiv.innerHTML = html;
+            resultDiv.className = 'result success';
+            resultDiv.style.display = 'block';
         }
         
         function showResult(message, type) {
             const resultDiv = document.getElementById('result');
-            resultDiv.textContent = message;
+            resultDiv.innerHTML = message;
             resultDiv.className = \`result \${type}\`;
             resultDiv.style.display = 'block';
         }
