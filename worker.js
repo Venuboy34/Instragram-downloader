@@ -155,118 +155,223 @@ async function getInstagramPostData(url) {
     try {
       const oembedResponse = await fetch(oembedUrl, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
       });
       
       if (oembedResponse.ok) {
         const oembedData = await oembedResponse.json();
-        return parseOembedData(oembedData, url);
+        const parsedData = parseOembedData(oembedData, url);
+        
+        // If oembed worked but no media, try scraping
+        if (!parsedData.media || parsedData.media.length === 0) {
+          const scrapedData = await scrapeInstagramPage(url);
+          if (scrapedData && scrapedData.media) {
+            parsedData.media = scrapedData.media;
+            parsedData.author = scrapedData.author || parsedData.author;
+            parsedData.title = scrapedData.title || parsedData.title;
+          }
+        }
+        
+        return parsedData;
       }
     } catch (e) {
-      console.log('Oembed failed, trying alternative method');
+      console.log('Oembed failed, trying scraping method');
     }
 
     // Method 2: Scrape the page directly
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-
-    const html = await response.text();
-    return parseInstagramHTML(html, url);
+    return await scrapeInstagramPage(url);
     
   } catch (error) {
     throw new Error(`Failed to fetch Instagram data: ${error.message}`);
   }
 }
 
+async function scrapeInstagramPage(url) {
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  return parseInstagramHTML(html, url);
+
 function parseOembedData(oembedData, originalUrl) {
+  const media = [];
+  
+  // Try to extract high-quality media URLs from thumbnail or other fields
+  if (oembedData.thumbnail_url) {
+    // For videos, thumbnail is usually available but we need the video URL
+    if (detectMediaType(originalUrl) === 'reel' || originalUrl.includes('/tv/')) {
+      // Try to get video URL by modifying thumbnail URL
+      const videoUrl = oembedData.thumbnail_url.replace(/\/s\d+x\d+\//, '/').replace(/\?.*/, '');
+      media.push({
+        type: 'video',
+        url: videoUrl,
+        quality: 'hd',
+        thumbnail: oembedData.thumbnail_url
+      });
+    }
+    
+    // Always add the thumbnail as an image option
+    media.push({
+      type: 'image',
+      url: oembedData.thumbnail_url,
+      quality: 'standard'
+    });
+  }
+
   return {
     title: oembedData.title || 'Instagram Post',
     author: oembedData.author_name || 'Unknown',
+    description: oembedData.title || '',
     thumbnail: oembedData.thumbnail_url || null,
     type: detectMediaType(originalUrl),
     url: originalUrl,
     timestamp: new Date().toISOString(),
-    media: [{
-      type: detectMediaType(originalUrl),
-      url: oembedData.thumbnail_url || null,
-      quality: 'standard'
-    }]
+    media: media.length > 0 ? media : null
   };
 }
 
 function parseInstagramHTML(html, url) {
   try {
-    // Extract JSON data from script tags
-    const jsonRegex = /window\._sharedData\s*=\s*({.+?});/;
-    const match = html.match(jsonRegex);
-    
-    if (match) {
-      const data = JSON.parse(match[1]);
-      return parseSharedData(data, url);
-    }
-
-    // Alternative: Look for og:image meta tags
-    const ogImageRegex = /<meta property="og:image" content="([^"]+)"/g;
-    const ogVideoRegex = /<meta property="og:video" content="([^"]+)"/g;
-    
-    const images = [];
-    const videos = [];
-    
-    let imageMatch;
-    while ((imageMatch = ogImageRegex.exec(html)) !== null) {
-      images.push(imageMatch[1]);
-    }
-    
-    let videoMatch;
-    while ((videoMatch = ogVideoRegex.exec(html)) !== null) {
-      videos.push(videoMatch[1]);
-    }
-
-    // Extract title
-    const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/);
-    const title = titleMatch ? titleMatch[1] : 'Instagram Post';
-    
-    // Extract description/author
-    const descMatch = html.match(/<meta property="og:description" content="([^"]+)"/);
-    const description = descMatch ? descMatch[1] : '';
-    
     const media = [];
+    let title = 'Instagram Post';
+    let author = 'Unknown';
+    let description = '';
+
+    // Method 1: Extract from script tags containing JSON data
+    const scriptRegex = /<script[^>]*>window\._sharedData\s*=\s*({.+?});<\/script>/;
+    const scriptMatch = html.match(scriptRegex);
     
+    if (scriptMatch) {
+      try {
+        const data = JSON.parse(scriptMatch[1]);
+        const parsedData = parseSharedData(data, url);
+        if (parsedData && parsedData.media && parsedData.media.length > 0) {
+          return parsedData;
+        }
+      } catch (e) {
+        console.log('Failed to parse _sharedData:', e.message);
+      }
+    }
+
+    // Method 2: Look for newer script tags with different patterns
+    const additionalDataRegex = /<script[^>]*type="application\/ld\+json"[^>]*>([^<]+)<\/script>/g;
+    let match;
+    while ((match = additionalDataRegex.exec(html)) !== null) {
+      try {
+        const jsonData = JSON.parse(match[1]);
+        if (jsonData['@type'] === 'ImageObject' || jsonData['@type'] === 'VideoObject') {
+          if (jsonData.contentUrl) {
+            media.push({
+              type: jsonData['@type'] === 'VideoObject' ? 'video' : 'image',
+              url: jsonData.contentUrl,
+              quality: 'hd'
+            });
+          }
+        }
+      } catch (e) {
+        // Skip invalid JSON
+      }
+    }
+
+    // Method 3: Extract from meta tags
+    const metaTags = {
+      'og:image': [],
+      'og:video': [],
+      'og:video:secure_url': [],
+      'og:title': null,
+      'og:description': null,
+      'twitter:image': [],
+      'twitter:player:stream': []
+    };
+
+    // Extract all meta tags
+    const metaRegex = /<meta\s+(?:property|name)="([^"]+)"\s+content="([^"]+)"/g;
+    let metaMatch;
+    while ((metaMatch = metaRegex.exec(html)) !== null) {
+      const [, property, content] = metaMatch;
+      if (metaTags.hasOwnProperty(property)) {
+        if (Array.isArray(metaTags[property])) {
+          metaTags[property].push(content);
+        } else {
+          metaTags[property] = content;
+        }
+      }
+    }
+
+    // Process meta tag data
+    title = metaTags['og:title'] || title;
+    description = metaTags['og:description'] || description;
+    author = extractAuthorFromDescription(description) || author;
+
     // Add videos first (higher priority)
-    videos.forEach(videoUrl => {
-      media.push({
-        type: 'video',
-        url: videoUrl,
-        quality: 'hd'
+    [...metaTags['og:video'], ...metaTags['og:video:secure_url'], ...metaTags['twitter:player:stream']]
+      .filter(Boolean)
+      .forEach(videoUrl => {
+        if (!media.some(m => m.url === videoUrl)) {
+          media.push({
+            type: 'video',
+            url: videoUrl,
+            quality: 'hd'
+          });
+        }
       });
-    });
-    
+
     // Add images
-    images.forEach(imageUrl => {
-      media.push({
-        type: 'image',
-        url: imageUrl,
-        quality: 'hd'
+    [...metaTags['og:image'], ...metaTags['twitter:image']]
+      .filter(Boolean)
+      .forEach(imageUrl => {
+        if (!media.some(m => m.url === imageUrl)) {
+          media.push({
+            type: 'image',
+            url: imageUrl,
+            quality: 'hd'
+          });
+        }
       });
-    });
+
+    // Method 4: Look for direct video/image URLs in the HTML
+    const directVideoRegex = /"video_url":"([^"]+)"/g;
+    let videoMatch;
+    while ((videoMatch = directVideoRegex.exec(html)) !== null) {
+      const videoUrl = videoMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+      if (!media.some(m => m.url === videoUrl)) {
+        media.push({
+          type: 'video',
+          url: videoUrl,
+          quality: 'hd'
+        });
+      }
+    }
+
+    const directImageRegex = /"display_url":"([^"]+)"/g;
+    let imageMatch;
+    while ((imageMatch = directImageRegex.exec(html)) !== null) {
+      const imageUrl = imageMatch[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+      if (!media.some(m => m.url === imageUrl)) {
+        media.push({
+          type: 'image',
+          url: imageUrl,
+          quality: 'hd'
+        });
+      }
+    }
 
     return {
       title: title,
       description: description,
-      author: extractAuthorFromDescription(description),
+      author: author,
       type: detectMediaType(url),
       url: url,
       timestamp: new Date().toISOString(),
